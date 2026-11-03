@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import httpx
 
-from . import Post, SourceError
+from ..posts import Post
+from . import SourceError
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ class GoogleNewsSource:
         except ET.ParseError as e:
             raise SourceError(f"Google News returned invalid XML for {query!r}: {e}") from e
 
+        now = datetime.now(timezone.utc)
         posts = []
         for item in root.iter("item"):
             pub = item.findtext("pubDate")
@@ -46,14 +49,18 @@ class GoogleNewsSource:
                 created = None
             if created is not None and created < since:
                 continue
+            link = item.findtext("link") or ""
+            title = item.findtext("title") or ""
             posts.append(
                 Post(
+                    id="gn:" + hashlib.sha1((link or title).encode()).hexdigest()[:16],
                     source=self.name,
                     query=query,
-                    url=item.findtext("link") or "",
-                    text=item.findtext("title") or "",
+                    url=link,
+                    text=title,
                     created_at=created,
                     author=item.findtext("source") or "",
+                    fetched_at=now,
                 )
             )
         log.info("google_news %r: %d recent items", query, len(posts))

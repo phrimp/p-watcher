@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HCMC Live Events</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg: #ffffff; --fg: #1d1d1f; --muted: #6b6b70; --panel: rgba(255,255,255,0.94); --line: #e3e3e6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111113; --fg: #ededf0; --muted: #9a9aa2; --panel: rgba(28,28,31,0.94); --line: #333338; }
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  .panel { position: absolute; z-index: 1000; top: 12px; left: 56px; right: 12px; max-width: 360px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .panel h1 { font-size: 15px; margin: 0 0 4px; }
+  .status { color: var(--muted); font-size: 12px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; font-size: 12px; }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    margin-right: 5px; vertical-align: -1px; background: var(--c); }
+  .popup h2 { font-size: 14px; margin: 0 0 4px; }
+  .popup .meta { color: #6b6b70; font-size: 12px; margin-bottom: 6px; }
+  .popup ol { padding-left: 18px; margin: 6px 0 0; max-height: 220px; overflow: auto; }
+  .popup li { margin-bottom: 6px; }
+  .popup li small { color: #6b6b70; display: block; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>HCMC live events</h1>
+  <div class="status" id="status">Loading…</div>
+  <div class="legend" id="legend"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const TYPES = {
+  flood: ["Ngập", "#1f77d0"], accident: ["Tai nạn", "#d62728"], fire: ["Cháy", "#ff7f0e"],
+  closure: ["Cấm đường", "#8c564b"], congestion: ["Kẹt xe", "#bcbd22"], fallen_tree: ["Cây đổ", "#2ca02c"],
+  collapse: ["Sập", "#9467bd"], other: ["Khác", "#7f7f7f"],
+};
+const REFRESH_MS = 60000;
+
+const map = L.map("map").setView([10.78, 106.70], 12);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; OpenStreetMap contributors",
+}).addTo(map);
+const layer = L.layerGroup().addTo(map);
+
+const legend = document.getElementById("legend");
+for (const [label, color] of Object.values(TYPES)) {
+  const s = document.createElement("span");
+  s.style.setProperty("--c", color);
+  s.textContent = label;
+  legend.appendChild(s);
+}
+
+function el(tag, text, attrs = {}) {
+  const e = document.createElement(tag);
+  if (text != null) e.textContent = text;  // textContent: post text is untrusted
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+}
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleString("vi-VN", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
+}
+
+function safeUrl(u) {
+  try {
+    const x = new URL(u);
+    return (x.protocol === "https:" || x.protocol === "http:") ? x.href : null;
+  } catch (err) {
+    // Unparseable URL: show the report as plain text instead of a link.
+    console.warn("report URL is not a valid URL, showing it as text:", u, err);
+    return null;
+  }
+}
+
+// Ages are computed in the browser from absolute times, so pins keep fading and
+// expired events disappear between `observe build` runs.
+function minutesSince(iso) { return Math.floor((Date.now() - Date.parse(iso)) / 60000); }
+
+function popupFor(p) {
+  const [label] = TYPES[p.type] || TYPES.other;
+  const root = el("div", null, { class: "popup" });
+  root.appendChild(el("h2", `${label}: ${p.summary}`));
+  root.appendChild(el("div",
+    `${p.place} · ${p.severity} · ${p.report_count} báo cáo · cập nhật ${minutesSince(p.last_seen)} phút trước`,
+    { class: "meta" }));
+  if (p.address) root.appendChild(el("div", p.address, { class: "meta" }));
+  const ol = el("ol");
+  for (const r of p.reports) {
+    const li = el("li");
+    const url = safeUrl(r.url);
+    if (url) li.appendChild(el("a", r.text || r.url, { href: url, target: "_blank", rel: "noopener noreferrer" }));
+    else li.appendChild(el("span", r.text));
+    li.appendChild(el("small", `${r.source} · ${r.author || "?"} · ${fmtTime(r.time)}`));
+    ol.appendChild(li);
+  }
+  root.appendChild(ol);
+  return root;
+}
+
+function render(fc) {
+  layer.clearLayers();
+  let events = 0, hot = 0;
+  for (const f of fc.features) {
+    const p = f.properties;
+    if (p.kind === "area") {
+      const ring = f.geometry.coordinates[0].map(([lng, lat]) => [lat, lng]);
+      const isHot = p.state === "hot";
+      if (isHot) hot++;
+      L.polygon(ring, { color: isHot ? "#d62728" : "#ff7f0e", weight: 1, dashArray: "4 4", fillOpacity: 0.06 })
+        .bindTooltip(`${isHot ? "Đang theo dõi sát" : "Đang hạ nhiệt"} · ${p.heat} bài/giờ`)
+        .addTo(layer);
+      continue;
+    }
+    const now = Date.now();
+    const last = Date.parse(p.last_seen), expires = Date.parse(p.expires_at);
+    if (expires <= now) continue;  // expired since the last build
+    events++;
+    const [lng, lat] = f.geometry.coordinates;
+    const [, color] = TYPES[p.type] || TYPES.other;
+    const total = expires - last;
+    const freshness = total > 0 ? Math.max(0.25, (expires - now) / total) : 1;  // fades with age
+    L.circleMarker([lat, lng], {
+      radius: 7 + Math.min(p.report_count, 6) * 2, color, weight: 2,
+      fillColor: color, fillOpacity: 0.55 * freshness, opacity: freshness,
+    }).bindPopup(popupFor(p), { maxWidth: 320 }).addTo(layer);
+  }
+  document.getElementById("status").textContent =
+    `${events} sự kiện · ${hot} khu vực nóng · dữ liệu lúc ${fmtTime(fc.generated_at)}`;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch(`events.geojson?t=${Date.now()}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    render(await res.json());
+  } catch (err) {
+    console.error("loading events.geojson failed:", err);
+    document.getElementById("status").textContent = `Không tải được dữ liệu (${err.message}). Đã chạy "observe build" chưa?`;
+  }
+}
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

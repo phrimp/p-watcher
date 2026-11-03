@@ -1,7 +1,7 @@
 [project]
 name = "observe"
 version = "0.1.0"
-description = "Prototype: watch an A->B route for traffic jams and find social posts about them"
+description = "Prototype: live map of incidents in Ho Chi Minh City from social posts and news"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",

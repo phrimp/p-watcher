@@ -53,37 +53,42 @@ def _str(name: str, default: str = "") -> str:
 class Settings:
     google_service_account_file: Path | None
     google_api_key: str
-    travel_mode: str
-    language: str
-    region: str
 
     fb_cookies_file: Path
     fb_state_file: Path
     fb_proxy: str
-    fb_max_queries: int
-    fb_results_per_query: int
+    fb_max_queries_per_run: int
+    fb_pages_per_query: int
     fb_request_delay_s: float
+    fb_recent_filter: bool
 
-    min_jam_length_m: int
-    lookback_minutes: int
     enable_google_news: bool
-    enable_nominatim: bool
-    nominatim_user_agent: str
+    city_suffix: str
+    lookback_minutes: int
+    data_dir: Path
+    map_dir: Path
     timezone: ZoneInfo
     log_level: str
 
-    def require_google_credentials(self) -> None:
-        if self.google_service_account_file is None and not self.google_api_key:
-            raise ConfigError(
-                "Set GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_MAPS_API_KEY in .env"
-            )
-        if (
-            self.google_service_account_file is not None
-            and not self.google_service_account_file.is_file()
-        ):
-            raise ConfigError(
-                f"GOOGLE_SERVICE_ACCOUNT_FILE not found: {self.google_service_account_file}"
-            )
+    @property
+    def posts_file(self) -> Path:
+        return self.data_dir / "posts.jsonl"
+
+    @property
+    def extractions_file(self) -> Path:
+        return self.data_dir / "extractions.jsonl"
+
+    @property
+    def geocode_cache_file(self) -> Path:
+        return self.data_dir / "geocode_cache.json"
+
+    @property
+    def areas_file(self) -> Path:
+        return self.data_dir / "areas.json"
+
+    @property
+    def geojson_file(self) -> Path:
+        return self.map_dir / "events.geojson"
 
 
 def load_settings(env_file: str | os.PathLike = ".env") -> Settings:
@@ -92,15 +97,11 @@ def load_settings(env_file: str | os.PathLike = ".env") -> Settings:
         load_dotenv(env_path, override=False)
     base = env_path.resolve().parent
 
-    def path_or_none(name: str) -> Path | None:
-        raw = _str(name)
+    def path(name: str, default: str = "") -> Path | None:
+        raw = _str(name, default)
         if not raw:
             return None
         p = Path(raw)
-        return p if p.is_absolute() else base / p
-
-    def path_required(name: str, default: str) -> Path:
-        p = Path(_str(name, default))
         return p if p.is_absolute() else base / p
 
     tz_name = _str("TIMEZONE", "Asia/Ho_Chi_Minh")
@@ -109,30 +110,25 @@ def load_settings(env_file: str | os.PathLike = ".env") -> Settings:
     except ZoneInfoNotFoundError as e:
         raise ConfigError(f"TIMEZONE {tz_name!r} is not a known time zone") from e
 
-    travel_mode = _str("ROUTES_TRAVEL_MODE", "DRIVE").upper()
-    if travel_mode not in ("DRIVE", "TWO_WHEELER"):
-        raise ConfigError(
-            f"ROUTES_TRAVEL_MODE must be DRIVE or TWO_WHEELER (traffic data only exists "
-            f"for these), got {travel_mode!r}"
-        )
+    sa = path("GOOGLE_SERVICE_ACCOUNT_FILE")
+    if sa is not None and not sa.is_file():
+        raise ConfigError(f"GOOGLE_SERVICE_ACCOUNT_FILE not found: {sa}")
 
     return Settings(
-        google_service_account_file=path_or_none("GOOGLE_SERVICE_ACCOUNT_FILE"),
+        google_service_account_file=sa,
         google_api_key=_str("GOOGLE_MAPS_API_KEY"),
-        travel_mode=travel_mode,
-        language=_str("ROUTES_LANGUAGE", "vi"),
-        region=_str("ROUTES_REGION", "vn"),
-        fb_cookies_file=path_required("FB_COOKIES_FILE", "secrets/facebook_cookies.json"),
-        fb_state_file=path_required("FB_STATE_FILE", "secrets/facebook_state.json"),
+        fb_cookies_file=path("FB_COOKIES_FILE", "secrets/facebook_cookies.json"),
+        fb_state_file=path("FB_STATE_FILE", "secrets/facebook_state.json"),
         fb_proxy=_str("FB_PROXY"),
-        fb_max_queries=_int("FB_MAX_QUERIES", 4),
-        fb_results_per_query=_int("FB_RESULTS_PER_QUERY", 8),
-        fb_request_delay_s=_float("FB_REQUEST_DELAY_SECONDS", 3.0),
-        min_jam_length_m=_int("MIN_JAM_LENGTH_M", 200),
-        lookback_minutes=_int("LOOKBACK_MINUTES", 120),
+        fb_max_queries_per_run=_int("FB_MAX_QUERIES_PER_RUN", 13),
+        fb_pages_per_query=_int("FB_PAGES_PER_QUERY", 2),
+        fb_request_delay_s=_float("FB_REQUEST_DELAY_SECONDS", 4.0),
+        fb_recent_filter=_bool("FB_RECENT_FILTER", True),
         enable_google_news=_bool("ENABLE_GOOGLE_NEWS", True),
-        enable_nominatim=_bool("ENABLE_NOMINATIM", True),
-        nominatim_user_agent=_str("NOMINATIM_USER_AGENT", "project-observe-prototype/0.1"),
+        city_suffix=_str("CITY_SUFFIX", "TPHCM"),
+        lookback_minutes=_int("LOOKBACK_MINUTES", 180),
+        data_dir=path("DATA_DIR", "data"),
+        map_dir=path("MAP_DIR", "map"),
         timezone=tz,
         log_level=_str("LOG_LEVEL", "INFO").upper(),
     )

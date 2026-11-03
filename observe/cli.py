@@ -1,288 +1,212 @@
-"""observe: check an A->B route for jams and look for posts about them.
+"""observe: live map of incidents in Ho Chi Minh City from social posts and news.
 
-Examples:
-  observe "Chợ Bến Thành, Quận 1" "Sân bay Tân Sơn Nhất"
-  observe 10.7725,106.6980 10.8185,106.6588 --speeds TRAFFIC_JAM,SLOW
-  observe "A" "B" --briefing          # also search main route streets when nothing is red
-  observe "A" "B" --watch 300         # re-poll every 5 min, search only new jams
+  observe collect          search Facebook + Google News, append new posts to data/posts.jsonl
+  observe pending          print posts that have no extraction yet (to analyse)
+  observe build            extractions -> geocoded events + hot areas -> map/events.geojson
+  observe serve            serve the map at http://127.0.0.1:8000
+
+Run `collect` about every 30 minutes; after `build`, hot areas get their own
+searches on the next `collect`.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import http.server
 import json
 import logging
 import sys
-import time
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import httpx
 
+from .areas import compute_areas, load_areas, save_areas
+from .collect import run_collect
 from .config import ConfigError, Settings, load_settings
-from .places import (
-    Nominatim,
-    build_queries,
-    dedupe,
-    main_streets,
-    match_text,
-    streets_for_steps,
-)
-from .routes import Route, RoutesClient, RoutesError
-from .sources import Post, SourceError
-from .traffic import Jam, attach_steps, find_jams, same_jam, speed_breakdown_m
+from .events import build_events
+from .export import to_geojson
+from .extraction import parse_extractions
+from .geocode import CachedGeocoder, GeocodeError, PlacesGeocoder
+from .google_auth import GoogleAuth, GoogleAuthError
+from .posts import PostStore
+from .sources import SourceError
 
 log = logging.getLogger("observe")
 
-SPEED_LABEL = {"NORMAL": "green", "SLOW": "orange", "TRAFFIC_JAM": "RED"}
+
+def _local(dt: datetime | None, settings: Settings) -> str:
+    return dt.astimezone(settings.timezone).strftime("%H:%M %d/%m") if dt else "?"
 
 
-@dataclass
-class Target:
-    """Something to search posts for: a jam, or the whole route (briefing)."""
+def cmd_collect(args, settings: Settings) -> int:
+    store = PostStore(settings.posts_file)
+    known = store.load()
+    areas = list(load_areas(settings.areas_file).values()) if not args.no_hot else []
+    since = datetime.now(timezone.utc) - timedelta(minutes=settings.lookback_minutes)
 
-    label: str
-    streets: list[str]
-    jam: Jam | None = None
-    posts: list[Post] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    with httpx.Client(follow_redirects=True) as http:
+        sources: list = []
+        if not args.no_facebook:
+            from .sources.facebook import FacebookSource
 
-
-def fmt_min(seconds: int) -> str:
-    return f"{seconds / 60:.0f} min"
-
-
-def fmt_time(dt: datetime | None, tz) -> str:
-    return dt.astimezone(tz).strftime("%H:%M %d/%m") if dt else "unknown time"
-
-
-def gmaps_link(lat: float, lng: float) -> str:
-    return f"https://www.google.com/maps?q={lat:.5f},{lng:.5f}"
-
-
-def print_route(route: Route) -> None:
-    print(f"\nRoute: {route.description or '(no description)'}")
-    print(
-        f"  {route.distance_m / 1000:.1f} km, {fmt_min(route.duration_s)} with traffic "
-        f"vs {fmt_min(route.static_duration_s)} without "
-        f"(delay {fmt_min(max(route.delay_s, 0))}, ratio {route.congestion_ratio:.2f})"
-    )
-    breakdown = speed_breakdown_m(route)
-    if breakdown:
-        parts = [
-            f"{SPEED_LABEL.get(k, k)} {v / 1000:.2f} km"
-            for k, v in sorted(breakdown.items(), key=lambda kv: -kv[1])
-        ]
-        print("  traffic: " + ", ".join(parts))
-
-
-def name_jam(jam: Jam, route: Route, geocoder: Nominatim | None) -> None:
-    attach_steps(jam, route.steps)
-    names = streets_for_steps(jam.steps)
-    if geocoder is not None:
-        info = geocoder.reverse(jam.midpoint)
-        time.sleep(1.0)  # Nominatim policy: max 1 request/second
-        if info:
-            if info["road"]:
-                names.insert(0, info["road"])
-            jam.area = info["area"]
-    jam.streets = dedupe(names)
-
-
-def print_jam(i: int, jam: Jam) -> None:
-    lat, lng = jam.midpoint
-    print(
-        f"\n  Jam #{i}: {jam.length_m / 1000:.2f} km ({'/'.join(sorted(jam.speeds))})"
-        f"\n    streets: {', '.join(jam.streets) or '(unknown)'}"
-        + (f"\n    area:    {jam.area}" if jam.area else "")
-        + f"\n    map:     {gmaps_link(lat, lng)}"
-    )
-
-
-def collect(target: Target, sources: list, settings: Settings, since: datetime) -> None:
-    queries = build_queries(target.streets, settings.fb_max_queries)
-    if not queries:
-        target.errors.append("no street names found, nothing to search")
-        return
-    seen_urls: set[str] = set()
-    for src in sources:
-        for q in queries:
             try:
-                found = src.search(q, since)
+                sources.append(
+                    FacebookSource(
+                        settings.fb_cookies_file,
+                        settings.fb_state_file,
+                        settings.fb_proxy,
+                        settings.fb_pages_per_query,
+                        settings.fb_request_delay_s,
+                        settings.fb_recent_filter,
+                    )
+                )
             except SourceError as e:
-                log.error("%s: %s", src.name, e)
-                target.errors.append(f"{src.name}: {e}")
-                break  # source-wide failure (e.g. expired login): skip its other queries
-            for p in found:
-                if p.url and p.url in seen_urls:
-                    continue
-                seen_urls.add(p.url)
-                p.matched_streets, p.matched_terms = match_text(p.text, target.streets)
-                target.posts.append(p)
-    epoch = datetime.min.replace(tzinfo=timezone.utc)
-    target.posts.sort(key=lambda p: (p.strong_match, p.created_at or epoch), reverse=True)
+                log.error("Facebook disabled: %s", e)
+        if settings.enable_google_news and not args.no_news:
+            from .sources.google_news import GoogleNewsSource
 
+            sources.append(GoogleNewsSource(http))
+        if not sources:
+            print("no sources enabled", file=sys.stderr)
+            return 1
 
-def print_target(target: Target, tz) -> None:
-    print(f"\n  Posts for {target.label} (searched: {', '.join(target.streets)})")
-    for err in target.errors:
-        print(f"    ! {err}")
-    if not target.posts:
-        print("    no recent posts found")
-        return
-    for p in target.posts:
-        tag = "MATCH" if p.strong_match else "weak "
-        text = " ".join(p.text.split())
-        if len(text) > 220:
-            text = text[:217] + "..."
-        print(
-            f"    [{tag}] {p.source} · {fmt_time(p.created_at, tz)} · {p.author or '?'}"
-            f"\n            {text}"
-            f"\n            {p.url}"
+        hot = [a for a in areas if a.state == "hot"]
+        print(f"sources: {', '.join(s.name for s in sources)} | hot areas: {len(hot)} | cooling: {len(areas) - len(hot)}")
+        report = run_collect(
+            sources,
+            set(known),
+            settings.city_suffix,
+            areas,
+            since,
+            settings.fb_max_queries_per_run,
         )
 
-
-def dump(run_dir: Path, route: Route, jams: list[Jam], targets: list[Target]) -> Path:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    path = run_dir / f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    data = {
-        "polled_at": datetime.now(timezone.utc).isoformat(),
-        "route": {
-            "description": route.description,
-            "distance_m": route.distance_m,
-            "duration_s": route.duration_s,
-            "static_duration_s": route.static_duration_s,
-            "speed_breakdown_m": speed_breakdown_m(route),
-        },
-        "jams": [
-            {
-                "length_m": round(j.length_m),
-                "speeds": sorted(j.speeds),
-                "midpoint": j.midpoint,
-                "streets": j.streets,
-                "area": j.area,
-                "instructions": [s.instruction for s in j.steps],
-            }
-            for j in jams
-        ],
-        "targets": [
-            {
-                "label": t.label,
-                "streets": t.streets,
-                "errors": t.errors,
-                "posts": [
-                    {
-                        "source": p.source,
-                        "query": p.query,
-                        "url": p.url,
-                        "author": p.author,
-                        "created_at": p.created_at.isoformat() if p.created_at else None,
-                        "text": p.text,
-                        "matched_streets": p.matched_streets,
-                        "matched_terms": p.matched_terms,
-                    }
-                    for p in t.posts
-                ],
-            }
-            for t in targets
-        ],
-    }
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    store.append(report.new_posts)
+    for src, qs in report.queries_run.items():
+        print(f"  {src}: {len(qs)} queries")
+    print(
+        f"new posts: {len(report.new_posts)} (skipped {report.duplicates} already seen, "
+        f"{report.off_topic} without event words) -> {settings.posts_file}"
+    )
+    for err in report.errors:
+        print(f"  ! {err}")
+    return 1 if report.errors and not report.new_posts else 0
 
 
-def build_sources(args, settings: Settings, http: httpx.Client) -> list:
-    sources: list = []
-    if not args.no_facebook:
-        from .sources.facebook import FacebookSource
-
-        try:
-            sources.append(
-                FacebookSource(
-                    settings.fb_cookies_file,
-                    settings.fb_state_file,
-                    settings.fb_proxy,
-                    settings.fb_results_per_query,
-                    settings.fb_request_delay_s,
-                )
+def cmd_pending(args, settings: Settings) -> int:
+    posts = PostStore(settings.posts_file).load()
+    done: set[str] = set()
+    if settings.extractions_file.exists():
+        result = parse_extractions(settings.extractions_file.read_text(encoding="utf-8").splitlines())
+        done = {e.post_id for e in result.events} | result.rejected_post_ids
+    pending = [p for p in posts.values() if p.id not in done]
+    pending.sort(key=lambda p: p.created_at or datetime.min.replace(tzinfo=timezone.utc))
+    for p in pending[: args.limit or None]:
+        text = " ".join(p.text.split())
+        print(
+            json.dumps(
+                {
+                    "post_id": p.id,
+                    "time": _local(p.created_at, settings),
+                    "source": p.source,
+                    "author": p.author,
+                    "query": p.query,
+                    "text": text[:700],
+                },
+                ensure_ascii=False,
             )
-        except SourceError as e:
-            log.error("Facebook disabled: %s", e)
-    if settings.enable_google_news and not args.no_news:
-        from .sources.google_news import GoogleNewsSource
-
-        sources.append(GoogleNewsSource(http))
-    return sources
+        )
+    print(f"# {len(pending)} pending of {len(posts)} posts", file=sys.stderr)
+    return 0
 
 
-def poll_once(args, settings, routes, geocoder, sources, known: list[Jam], first: bool) -> list[Jam]:
-    route = routes.compute(args.origin, args.destination)
-    print(f"\n=== {datetime.now(settings.timezone).strftime('%H:%M:%S')} ===")
-    print_route(route)
+def cmd_build(args, settings: Settings) -> int:
+    posts = PostStore(settings.posts_file).load()
+    if not settings.extractions_file.exists():
+        print(f"no extractions yet: write {settings.extractions_file} first (see `observe pending`)", file=sys.stderr)
+        return 1
+    extractions = parse_extractions(settings.extractions_file.read_text(encoding="utf-8").splitlines())
+    for err in extractions.errors:
+        print(f"  ! extractions {err}")
+    for w in extractions.warnings:
+        print(f"  ~ extractions {w}")
 
-    jams = find_jams(route, set(args.speeds), settings.min_jam_length_m)
-    for j in jams:
-        name_jam(j, route, geocoder)
-    if jams:
-        print(f"\n  {len(jams)} jam(s) detected:")
-        for i, j in enumerate(jams, 1):
-            print_jam(i, j)
-    else:
-        print(f"\n  No {'/'.join(args.speeds)} stretches >= {settings.min_jam_length_m} m.")
+    now = datetime.now(timezone.utc)
+    with httpx.Client() as http:
+        try:
+            auth = GoogleAuth(settings.google_service_account_file, settings.google_api_key)
+            geocoder = CachedGeocoder(PlacesGeocoder(http, auth), settings.geocode_cache_file)
+        except (GoogleAuthError, GeocodeError) as e:
+            print(f"geocoder unavailable: {e}", file=sys.stderr)
+            return 1
+        try:
+            result = build_events(posts.values(), extractions, geocoder, now)
+        finally:
+            geocoder.flush()  # keep paid lookups even if the build fails part-way
 
-    cleared = [k for k in known if not any(same_jam(k, j) for j in jams)]
-    for k in cleared:
-        print(f"  cleared: jam on {', '.join(k.streets) or '?'}")
+    areas = compute_areas(result.events, now, load_areas(settings.areas_file))
+    save_areas(settings.areas_file, areas)
+    fc = to_geojson(result.events, areas, now)
+    settings.map_dir.mkdir(parents=True, exist_ok=True)
+    tmp = settings.geojson_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(fc, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(settings.geojson_file)
 
-    targets: list[Target] = []
-    for i, j in enumerate(jams, 1):
-        if any(same_jam(j, k) for k in known):
-            continue  # already searched in an earlier poll
-        if j.streets:
-            targets.append(Target(label=f"jam #{i}", streets=j.streets[:2], jam=j))
-    if first and args.briefing and not targets:
-        streets = main_streets(route)
-        if streets:
-            targets.append(Target(label="route briefing", streets=streets))
+    live = [e for e in result.events if e.expires_at > now]
+    print(f"events: {len(live)} live, {len(result.events) - len(live)} expired | rejected posts: {len(extractions.rejected_post_ids)}")
+    for e in sorted(live, key=lambda e: e.last_seen, reverse=True):
+        print(
+            f"  [{e.type}/{e.severity}] {e.place} — {e.summary} "
+            f"({e.report_count} report(s), last {_local(e.last_seen, settings)})"
+        )
+    for u in result.unlocated:
+        print(f"  ? {u.post_id}: {u.reason} (query: {u.query})")
+    for pid in result.unknown_post_ids:
+        print(f"  ? extraction for unknown post {pid}")
+    for a in areas:
+        print(f"  area {a.cell} {a.state} heat={a.heat} next queries: {a.queries}")
+    print(f"map data -> {settings.geojson_file}")
+    return 0
 
-    if targets and sources:
-        since = datetime.now(timezone.utc) - timedelta(minutes=settings.lookback_minutes)
-        for t in targets:
-            collect(t, sources, settings, since)
-            print_target(t, settings.timezone)
-    elif targets:
-        print("\n  (no post sources enabled, skipping search)")
 
-    out = dump(Path(args.runs_dir), route, jams, targets)
-    print(f"\n  saved: {out}")
-    return jams
+def cmd_serve(args, settings: Settings) -> int:
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(settings.map_dir))
+    # Bound to localhost only: the page shows scraped post text and author names.
+    with http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler) as server:
+        print(f"map: http://127.0.0.1:{args.port}/  (Ctrl-C to stop)")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopped")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="observe", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("origin", help='address or "lat,lng"')
-    ap.add_argument("destination", help='address or "lat,lng"')
-    ap.add_argument(
-        "--speeds",
-        default="TRAFFIC_JAM",
-        type=lambda s: [x.strip().upper() for x in s.split(",") if x.strip()],
-        help="speed categories that count as a jam (default TRAFFIC_JAM; add SLOW to test off-peak)",
-    )
-    ap.add_argument("--briefing", action="store_true", help="search main route streets if no jam")
-    ap.add_argument("--watch", type=int, metavar="SECONDS", help="re-poll every N seconds")
-    ap.add_argument("--max-polls", type=int, default=0, help="stop watching after N polls (0 = no limit)")
-    ap.add_argument("--no-facebook", action="store_true")
-    ap.add_argument("--no-news", action="store_true")
+    ap = argparse.ArgumentParser(prog="observe", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--env", default=".env", help="env file (default .env)")
-    ap.add_argument("--runs-dir", default="runs", help="where JSON results are saved")
-    args = ap.parse_args(argv)
+    sub = ap.add_subparsers(dest="command", required=True)
 
+    c = sub.add_parser("collect", help="search sources and store new posts")
+    c.add_argument("--no-facebook", action="store_true")
+    c.add_argument("--no-news", action="store_true")
+    c.add_argument("--no-hot", action="store_true", help="skip hot-area searches")
+    c.set_defaults(fn=cmd_collect)
+
+    p = sub.add_parser("pending", help="print posts without an extraction")
+    p.add_argument("--limit", type=int, default=0)
+    p.set_defaults(fn=cmd_pending)
+
+    b = sub.add_parser("build", help="geocode extractions and write the map data")
+    b.set_defaults(fn=cmd_build)
+
+    s = sub.add_parser("serve", help="serve the map page locally")
+    s.add_argument("--port", type=int, default=8000)
+    s.set_defaults(fn=cmd_serve)
+
+    args = ap.parse_args(argv)
     try:
         settings = load_settings(args.env)
-        settings.require_google_credentials()
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         return 2
@@ -290,44 +214,9 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(levelname)s %(name)s: %(message)s",
     )
-    if args.watch is not None and args.watch < 60:
-        print("--watch must be at least 60 seconds (each poll is a paid Routes API call)", file=sys.stderr)
-        return 2
-
-    with httpx.Client(follow_redirects=True) as http:
-        routes = RoutesClient(
-            http,
-            service_account_file=settings.google_service_account_file,
-            api_key=settings.google_api_key,
-            travel_mode=settings.travel_mode,
-            language=settings.language,
-            region=settings.region,
-        )
-        geocoder = (
-            Nominatim(http, settings.nominatim_user_agent, settings.language)
-            if settings.enable_nominatim
-            else None
-        )
-        sources = build_sources(args, settings, http)
-        print("sources: " + (", ".join(s.name for s in sources) or "none"))
-
-        known: list[Jam] = []
-        polls = 0
-        try:
-            while True:
-                polls += 1
-                try:
-                    known = poll_once(args, settings, routes, geocoder, sources, known, polls == 1)
-                except RoutesError as e:
-                    log.error("poll %d failed: %s", polls, e)
-                    if args.watch is None:
-                        return 1
-                if args.watch is None or (args.max_polls and polls >= args.max_polls):
-                    return 0
-                time.sleep(args.watch)
-        except KeyboardInterrupt:
-            print("\nstopped")
-            return 0
+    # httpx logs every request at INFO; keep the output readable.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return args.fn(args, settings)
 
 
 if __name__ == "__main__":

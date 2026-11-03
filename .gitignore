@@ -1,6 +1,9 @@
 .env
 secrets/
+data/
 runs/
+map/events.geojson
+map/*.tmp
 .venv/
 __pycache__/
 *.egg-info/
